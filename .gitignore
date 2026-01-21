@@ -1,0 +1,6 @@
+/target
+storage
+*.mp3
+*.py
+*.sh
+*.txt
