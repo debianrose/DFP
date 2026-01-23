@@ -28,13 +28,14 @@ var (
 )
 
 const (
-	CompressLimit = 10 * 1024 * 1024 // 10MB
+	CompressLimit = 10 * 1024 * 1024
 )
 
 type Srv struct {
 	port   uint16
 	tls    *tls.Config
 	crypto *Crypto
+	comp   *Compressor
 	mu     sync.RWMutex
 	files  []string
 	stats  map[string]*Stat
@@ -53,6 +54,7 @@ func NewSrv(port uint16, pass string) (*Srv, error) {
 		port:   port,
 		tls:    tls,
 		crypto: NewCrypto(pass),
+		comp:   NewCompressor(),
 		files:  []string{},
 		stats:  make(map[string]*Stat),
 	}, nil
@@ -67,7 +69,7 @@ func (s *Srv) Run(ui *SrvUI) error {
 	defer l.Close()
 
 	ui.Log(fmt.Sprintf("🚀 Server started on %s", addr))
-	ui.Log(fmt.Sprintf("🔒 Encryption: ChaCha20-Poly1305 (parallel)"))
+	ui.Log(fmt.Sprintf("🔒 Encryption: AES-GCM"))
 	ui.Log(fmt.Sprintf("📦 Compress: files < %d MB", CompressLimit/1024/1024))
 	s.scan()
 
@@ -152,16 +154,18 @@ func (s *Srv) upload(st quic.Stream, ui *SrvUI) {
 		ui.Log(fmt.Sprintf("⚠️ Size mismatch: got %d, expected %d", len(data), sz))
 	}
 	
-	compress := len(data) <= CompressLimit
-	
 	procStart := time.Now()
-	var processed []byte
 	
-	if compress {
+	var processed []byte
+	var compress bool
+	
+	if len(data) <= CompressLimit {
 		ui.Log(fmt.Sprintf("📦 Compressing %s...", name))
-		processed = Zip(data)
+		processed = s.comp.Zip(data)
+		compress = true
 	} else {
 		processed = data
+		compress = false
 	}
 	
 	ui.Log(fmt.Sprintf("🔐 Encrypting %s...", name))
@@ -170,6 +174,16 @@ func (s *Srv) upload(st quic.Stream, ui *SrvUI) {
 		ui.Log(fmt.Sprintf("❌ Encryption failed: %s", err))
 		st.Write([]byte("ER"))
 		return
+	}
+	
+	if compress {
+		meta := make([]byte, 1)
+		meta[0] = 1
+		enc = append(meta, enc...)
+	} else {
+		meta := make([]byte, 1)
+		meta[0] = 0
+		enc = append(meta, enc...)
 	}
 	
 	procTime := time.Since(procStart)
@@ -210,20 +224,29 @@ func (s *Srv) download(st quic.Stream, ui *SrvUI) {
 	}
 
 	start := time.Now()
+	
+	compressFlag := enc[0]
+	encData := enc[1:]
+	
 	ui.Log(fmt.Sprintf("🔓 Decrypting %s...", name))
-	processed, err := s.crypto.Dec(enc)
+	processed, err := s.crypto.Dec(encData)
 	if err != nil {
 		ui.Log(fmt.Sprintf("❌ Decryption failed: %s", err))
 		binary.Write(st, binary.BigEndian, uint64(0))
 		return
 	}
 	
-	ui.Log(fmt.Sprintf("📦 Decompressing %s...", name))
-	data, err := Unzip(processed)
-	if err != nil {
-		ui.Log(fmt.Sprintf("❌ Decompression failed: %s", err))
-		binary.Write(st, binary.BigEndian, uint64(0))
-		return
+	var data []byte
+	if compressFlag == 1 {
+		ui.Log(fmt.Sprintf("📦 Decompressing %s...", name))
+		data, err = s.comp.Unzip(processed)
+		if err != nil {
+			ui.Log(fmt.Sprintf("❌ Decompression failed: %s", err))
+			binary.Write(st, binary.BigEndian, uint64(0))
+			return
+		}
+	} else {
+		data = processed
 	}
 	
 	procTime := time.Since(start)

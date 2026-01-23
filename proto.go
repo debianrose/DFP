@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/scrypt"
 )
@@ -102,21 +101,23 @@ func (c *Crypto) Dec(data []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-func Zip(data []byte) []byte {
-	var b bytes.Buffer
-	w, _ := gzip.NewWriterLevel(&b, gzip.BestCompression)
-	w.Write(data)
-	w.Close()
-	return b.Bytes()
+type Compressor struct {
+	enc *zstd.Encoder
+	dec *zstd.Decoder
 }
 
-func Unzip(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
+func NewCompressor() *Compressor {
+	enc, _ := zstd.NewWriter(nil)
+	dec, _ := zstd.NewReader(nil)
+	return &Compressor{enc: enc, dec: dec}
+}
+
+func (c *Compressor) Zip(data []byte) []byte {
+	return c.enc.EncodeAll(data, make([]byte, 0, len(data)))
+}
+
+func (c *Compressor) Unzip(data []byte) ([]byte, error) {
+	return c.dec.DecodeAll(data, nil)
 }
 
 func GenTLS() (*tls.Config, error) {
