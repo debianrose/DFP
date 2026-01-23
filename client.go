@@ -118,7 +118,7 @@ func (c *Cli) Download(addr, remote, local string, onProg func(float64)) error {
 		return err
 	}
 	if sz == 0 {
-		return fmt.Errorf("not found")
+		return fmt.Errorf("file not found")
 	}
 
 	buf := bytes.NewBuffer(make([]byte, 0, sz))
@@ -147,6 +147,8 @@ func (c *Cli) Download(addr, remote, local string, onProg func(float64)) error {
 		return fmt.Errorf("incomplete download: got %d, expected %d", buf.Len(), sz)
 	}
 
+	os.MkdirAll(filepath.Dir(local), 0755)
+	
 	return os.WriteFile(local, buf.Bytes(), 0644)
 }
 
@@ -163,17 +165,26 @@ func (c *Cli) List(addr string) ([]FileItem, error) {
 	st.Write([]byte{2})
 
 	var cnt uint32
-	binary.Read(st, binary.BigEndian, &cnt)
+	if err := binary.Read(st, binary.BigEndian, &cnt); err != nil {
+		return nil, err
+	}
 
 	items := []FileItem{}
 	for i := uint32(0); i < cnt; i++ {
 		var nLen uint32
-		binary.Read(st, binary.BigEndian, &nLen)
+		if err := binary.Read(st, binary.BigEndian, &nLen); err != nil {
+			return nil, err
+		}
+		
 		nb := make([]byte, nLen)
-		io.ReadFull(st, nb)
+		if _, err := io.ReadFull(st, nb); err != nil {
+			return nil, err
+		}
 
 		var sz uint64
-		binary.Read(st, binary.BigEndian, &sz)
+		if err := binary.Read(st, binary.BigEndian, &sz); err != nil {
+			return nil, err
+		}
 
 		items = append(items, FileItem{
 			Name: string(nb),
@@ -223,7 +234,10 @@ func (fb *FileBrowser) scan() {
 	fb.items = []BrowserItem{{name: "..", isDir: true}}
 	
 	for _, e := range entries {
-		info, _ := e.Info()
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
 		fb.items = append(fb.items, BrowserItem{
 			name:  e.Name(),
 			isDir: e.IsDir(),
@@ -340,7 +354,8 @@ func (c *CliUI) Init() tea.Cmd {
 func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
+		key := msg.String()
+		switch key {
 		case "ctrl+c":
 			return c, tea.Quit
 		case "q":
@@ -351,16 +366,11 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if c.state == 0 && c.addr.Value() != "" {
 				c.state = 1
 				return c, nil
-			} else if c.state == 1 {
-				c.action = 0
-				if msg.String() == "enter" {
-					c.state = 2
-					return c, nil
-				}
 			} else if c.state == 2 {
 				if path, isFile := c.browser.Select(); isFile {
 					c.selFile = path
 					c.state = 3
+					c.progress = 0
 					return c, tea.Batch(c.doUpload(), updateProgress())
 				}
 			} else if c.state == 4 {
@@ -368,6 +378,7 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if ok {
 					c.remoteFile = i.Name
 					c.state = 3
+					c.progress = 0
 					return c, tea.Batch(c.doDownload(), updateProgress())
 				}
 			}
@@ -377,6 +388,11 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return c, nil
 			} else if c.state == 1 {
 				c.state = 0
+				return c, nil
+			} else if c.state == 5 {
+				c.state = 1
+				c.err = ""
+				c.msg = ""
 				return c, nil
 			}
 		case "u":
@@ -413,18 +429,18 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.progress >= 1.0 {
 			c.state = 5
 			if c.action == 0 {
-				c.msg = "✅ Upload complete!"
+				c.msg = fmt.Sprintf("✅ Upload complete: %s", filepath.Base(c.selFile))
 			} else {
-				c.msg = "✅ Download complete!"
+				c.msg = fmt.Sprintf("✅ Download complete: %s", c.remoteFile)
 			}
 		}
-		return c, updateProgress()
+		return c, nil
 	case errMsg:
 		c.err = string(msg)
 		c.state = 5
 		return c, nil
 	case updateMsg:
-		if c.state == 3 {
+		if c.state == 3 && c.progress < 1.0 {
 			return c, updateProgress()
 		}
 	case filesMsg:
@@ -454,7 +470,7 @@ func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (c *CliUI) View() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("🚀 QUIC Client") + "\n\n")
+	b.WriteString(titleStyle.Render("DFP Client") + "\n\n")
 
 	switch c.state {
 	case 0:
@@ -488,7 +504,7 @@ func (c *CliUI) View() string {
 		} else {
 			b.WriteString(successStyle.Render(c.msg))
 		}
-		b.WriteString("\n\n" + dimStyle.Render("Press q to quit"))
+		b.WriteString("\n\n" + dimStyle.Render("Press Esc to return or q to quit"))
 	}
 
 	return b.String()

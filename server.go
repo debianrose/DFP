@@ -27,6 +27,10 @@ var (
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
 )
 
+const (
+	CompressLimit = 10 * 1024 * 1024 // 10MB
+)
+
 type Srv struct {
 	port   uint16
 	tls    *tls.Config
@@ -63,7 +67,8 @@ func (s *Srv) Run(ui *SrvUI) error {
 	defer l.Close()
 
 	ui.Log(fmt.Sprintf("🚀 Server started on %s", addr))
-	ui.Log(fmt.Sprintf("🔒 Encryption: AES-256-GCM + Argon2"))
+	ui.Log(fmt.Sprintf("🔒 Encryption: ChaCha20-Poly1305 (parallel)"))
+	ui.Log(fmt.Sprintf("📦 Compress: files < %d MB", CompressLimit/1024/1024))
 	s.scan()
 
 	for {
@@ -147,16 +152,27 @@ func (s *Srv) upload(st quic.Stream, ui *SrvUI) {
 		ui.Log(fmt.Sprintf("⚠️ Size mismatch: got %d, expected %d", len(data), sz))
 	}
 	
-	ui.Log(fmt.Sprintf("📦 Compressing %s...", name))
-	comp := Zip(data)
+	compress := len(data) <= CompressLimit
+	
+	procStart := time.Now()
+	var processed []byte
+	
+	if compress {
+		ui.Log(fmt.Sprintf("📦 Compressing %s...", name))
+		processed = Zip(data)
+	} else {
+		processed = data
+	}
 	
 	ui.Log(fmt.Sprintf("🔐 Encrypting %s...", name))
-	enc, err := s.crypto.Enc(comp)
+	enc, err := s.crypto.Enc(processed)
 	if err != nil {
 		ui.Log(fmt.Sprintf("❌ Encryption failed: %s", err))
 		st.Write([]byte("ER"))
 		return
 	}
+	
+	procTime := time.Since(procStart)
 
 	path := filepath.Join(STORE, name+EXT)
 	if err := os.WriteFile(path, enc, 0600); err != nil {
@@ -170,7 +186,7 @@ func (s *Srv) upload(st quic.Stream, ui *SrvUI) {
 	ratio := float64(len(data)) / float64(len(enc))
 	speed := float64(len(data)) / duration.Seconds() / 1024 / 1024
 	
-	ui.Log(fmt.Sprintf("✅ %s saved (%.2fx, %.2f MB/s)", name, ratio, speed))
+	ui.Log(fmt.Sprintf("✅ %s saved (%.2fx, proc: %v, %.2f MB/s)", name, ratio, procTime.Round(time.Millisecond), speed))
 	
 	st.Write([]byte("OK"))
 	time.Sleep(100 * time.Millisecond)
@@ -195,7 +211,7 @@ func (s *Srv) download(st quic.Stream, ui *SrvUI) {
 
 	start := time.Now()
 	ui.Log(fmt.Sprintf("🔓 Decrypting %s...", name))
-	comp, err := s.crypto.Dec(enc)
+	processed, err := s.crypto.Dec(enc)
 	if err != nil {
 		ui.Log(fmt.Sprintf("❌ Decryption failed: %s", err))
 		binary.Write(st, binary.BigEndian, uint64(0))
@@ -203,12 +219,14 @@ func (s *Srv) download(st quic.Stream, ui *SrvUI) {
 	}
 	
 	ui.Log(fmt.Sprintf("📦 Decompressing %s...", name))
-	data, err := Unzip(comp)
+	data, err := Unzip(processed)
 	if err != nil {
 		ui.Log(fmt.Sprintf("❌ Decompression failed: %s", err))
 		binary.Write(st, binary.BigEndian, uint64(0))
 		return
 	}
+	
+	procTime := time.Since(start)
 
 	binary.Write(st, binary.BigEndian, uint64(len(data)))
 
@@ -231,7 +249,7 @@ func (s *Srv) download(st quic.Stream, ui *SrvUI) {
 
 	duration := time.Since(start)
 	speed := float64(len(data)) / duration.Seconds() / 1024 / 1024
-	ui.Log(fmt.Sprintf("✅ %s sent (%.2f MB/s)", name, speed))
+	ui.Log(fmt.Sprintf("✅ %s sent (proc: %v, %.2f MB/s)", name, procTime.Round(time.Millisecond), speed))
 }
 
 func (s *Srv) list(st quic.Stream, ui *SrvUI) {
@@ -321,7 +339,7 @@ func (s *SrvUI) View() string {
 	defer s.mu.Unlock()
 
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("🔐 Production QUIC Server") + "\n\n")
+	b.WriteString(titleStyle.Render("🔐 DFP Server") + "\n\n")
 	b.WriteString(s.list.View() + "\n\n")
 
 	if s.prog > 0 && s.prog < 1 {
