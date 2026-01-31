@@ -1,560 +1,1235 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"encoding/binary"
-	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
+    "context"
+    "crypto/rand"
+    "crypto/tls"
+    "encoding/binary"
+    "fmt"
+    "io"
+    "os"
+    "path/filepath"
+    "time"
 
-	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/quic-go/quic-go"
+    "github.com/quic-go/quic-go"
 )
 
-var (
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
-)
-
-type Cli struct {
-	tls *tls.Config
+type DFPClient struct {
+    tlsConfig  *tls.Config
+    quicConfig *quic.Config
+    version    uint8
+    sessionID  [16]byte
+    sequence   uint32
 }
 
-func NewCli() *Cli {
-	return &Cli{
-		tls: &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"qft"},
-		},
-	}
+type TransferStats struct {
+    Bytes    uint64
+    Duration time.Duration
+    Speed    float64
+    Errors   uint
+    Retries  uint
 }
 
-func (c *Cli) Upload(addr, local, remote string, onProg func(float64)) error {
-	data, err := os.ReadFile(local)
-	if err != nil {
-		return err
-	}
+func NewDFPClient() *DFPClient {
+    tlsConfig, _ := GenerateTLSConfig()
+    tlsConfig.InsecureSkipVerify = true
+    tlsConfig.ClientAuth = tls.NoClientCert
 
-	var conn quic.Connection
-	for i := 0; i < MaxRetries; i++ {
-		conn, err = quic.DialAddr(context.Background(), addr, c.tls, QCfg())
-		if err == nil {
-			break
-		}
-		time.Sleep(time.Second * time.Duration(i+1))
-	}
-	if err != nil {
-		return err
-	}
-	defer conn.CloseWithError(0, "")
+    quicConfig := NewProtocolConfig().ToQUICConfig()
 
-	st, _ := conn.OpenStreamSync(context.Background())
-	defer st.Close()
+    var sessionID [16]byte
+    io.ReadFull(rand.Reader, sessionID[:])
 
-	st.Write([]byte{0})
-	binary.Write(st, binary.BigEndian, uint32(len(remote)))
-	st.Write([]byte(remote))
-	binary.Write(st, binary.BigEndian, uint64(len(data)))
-
-	var sent uint64
-	for sent < uint64(len(data)) {
-		end := sent + CHUNK
-		if end > uint64(len(data)) {
-			end = uint64(len(data))
-		}
-		n, err := st.Write(data[sent:end])
-		if err != nil {
-			return err
-		}
-		sent += uint64(n)
-		if onProg != nil {
-			onProg(float64(sent) / float64(len(data)))
-		}
-	}
-
-	ack := make([]byte, 2)
-	n, err := io.ReadFull(st, ack)
-	if err != nil && err != io.EOF {
-		return err
-	}
-	if n >= 2 && string(ack[:2]) != "OK" {
-		return fmt.Errorf("server error")
-	}
-	return nil
+    return &DFPClient{
+        tlsConfig:  tlsConfig,
+        quicConfig: quicConfig,
+        version:    PROTOCOL_VERSION,
+        sessionID:  sessionID,
+        sequence:   1,
+    }
 }
 
-func (c *Cli) Download(addr, remote, local string, onProg func(float64)) error {
-	var conn quic.Connection
-	var err error
-	for i := 0; i < MaxRetries; i++ {
-		conn, err = quic.DialAddr(context.Background(), addr, c.tls, QCfg())
-		if err == nil {
-			break
-		}
-		time.Sleep(time.Second * time.Duration(i+1))
-	}
-	if err != nil {
-		return err
-	}
-	defer conn.CloseWithError(0, "")
+func (c *DFPClient) negotiateVersion(conn quic.Connection) (uint8, error) {
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return 0, err
+    }
+    defer stream.Close()
 
-	st, _ := conn.OpenStreamSync(context.Background())
-	defer st.Close()
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    c.version,
+        Command:    CMD_PING,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
 
-	st.Write([]byte{1})
-	binary.Write(st, binary.BigEndian, uint32(len(remote)))
-	st.Write([]byte(remote))
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return 0, err
+    }
 
-	var sz uint64
-	if err := binary.Read(st, binary.BigEndian, &sz); err != nil {
-		return err
-	}
-	if sz == 0 {
-		return fmt.Errorf("file not found")
-	}
+    var response ProtocolHeader
+    if err := binary.Read(stream, binary.BigEndian, &response); err != nil {
+        return 0, err
+    }
 
-	buf := bytes.NewBuffer(make([]byte, 0, sz))
-	var rcv uint64
-	tmp := make([]byte, CHUNK)
+    if response.Magic != HEADER_MAGIC {
+        return 0, fmt.Errorf("invalid response")
+    }
 
-	for rcv < sz {
-		n, err := st.Read(tmp)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		if n == 0 {
-			break
-		}
-		buf.Write(tmp[:n])
-		rcv += uint64(n)
-		if onProg != nil {
-			onProg(float64(rcv) / float64(sz))
-		}
-	}
+    if response.Version < MIN_VERSION || response.Version > MAX_VERSION {
+        return 0, fmt.Errorf("unsupported server version: %d", response.Version)
+    }
 
-	if uint64(buf.Len()) != sz {
-		return fmt.Errorf("incomplete download: got %d, expected %d", buf.Len(), sz)
-	}
-
-	os.MkdirAll(filepath.Dir(local), 0755)
-	
-	return os.WriteFile(local, buf.Bytes(), 0644)
+    return response.Version, nil
 }
 
-func (c *Cli) List(addr string) ([]FileItem, error) {
-	conn, err := quic.DialAddr(context.Background(), addr, c.tls, QCfg())
-	if err != nil {
-		return nil, err
-	}
-	defer conn.CloseWithError(0, "")
+func (c *DFPClient) Upload(addr, localPath, remoteName string, crypto *ProtocolCrypto, stats *TransferStats) error {
+    data, err := os.ReadFile(localPath)
+    if err != nil {
+        return err
+    }
 
-	st, _ := conn.OpenStreamSync(context.Background())
-	defer st.Close()
+    var conn quic.Connection
+    for i := 0; i < MAX_RETRIES; i++ {
+        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        conn, err = quic.DialAddr(ctx, addr, c.tlsConfig, c.quicConfig)
+        cancel()
 
-	st.Write([]byte{2})
+        if err == nil {
+            break
+        }
 
-	var cnt uint32
-	if err := binary.Read(st, binary.BigEndian, &cnt); err != nil {
-		return nil, err
-	}
+        stats.Retries++
+        time.Sleep(time.Duration(i+1) * time.Second)
+    }
 
-	items := []FileItem{}
-	for i := uint32(0); i < cnt; i++ {
-		var nLen uint32
-		if err := binary.Read(st, binary.BigEndian, &nLen); err != nil {
-			return nil, err
-		}
-		
-		nb := make([]byte, nLen)
-		if _, err := io.ReadFull(st, nb); err != nil {
-			return nil, err
-		}
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
 
-		var sz uint64
-		if err := binary.Read(st, binary.BigEndian, &sz); err != nil {
-			return nil, err
-		}
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
 
-		items = append(items, FileItem{
-			Name: string(nb),
-			Size: int64(sz),
-		})
-	}
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
 
-	return items, nil
+    flags := uint16(FLAG_ENCRYPTED)
+    if len(data) > COMPRESS_THRESHOLD && negotiatedVersion >= 2 {
+        flags |= FLAG_COMPRESSED
+    }
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_UPLOAD,
+        Flags:      flags,
+        Sequence:   c.sequence,
+        DataLength: uint64(len(data)),
+    }
+    c.sequence++
+
+    startTime := time.Now()
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(remoteName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    sent := uint64(0)
+    for sent < uint64(len(data)) {
+        end := sent + CHUNK_SIZE
+        if end > uint64(len(data)) {
+            end = uint64(len(data))
+        }
+
+        n, err := stream.Write(data[sent:end])
+        if err != nil {
+            stats.Errors++
+            return err
+        }
+
+        sent += uint64(n)
+        stats.Bytes = sent
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    stats.Duration = time.Since(startTime)
+    if stats.Duration > 0 {
+        stats.Speed = float64(stats.Bytes) / stats.Duration.Seconds()
+    }
+
+    return nil
 }
 
-type CliUI struct {
-	state      int
-	action     int
-	addr       textinput.Model
-	browser    *FileBrowser
-	remoteList list.Model
-	prog       progress.Model
-	progress   float64
-	err        string
-	msg        string
-	cli        *Cli
-	selFile    string
-	remoteFile string
+func (c *DFPClient) Download(addr, remoteName, localPath string, crypto *ProtocolCrypto, stats *TransferStats) error {
+    var conn quic.Connection
+    var err error
+
+    for i := 0; i < MAX_RETRIES; i++ {
+        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        conn, err = quic.DialAddr(ctx, addr, c.tlsConfig, c.quicConfig)
+        cancel()
+
+        if err == nil {
+            break
+        }
+
+        stats.Retries++
+        time.Sleep(time.Duration(i+1) * time.Second)
+    }
+
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DOWNLOAD,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    startTime := time.Now()
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(remoteName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    var responseHeader ProtocolHeader
+    if err := binary.Read(stream, binary.BigEndian, &responseHeader); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if responseHeader.Command == CMD_ERROR {
+        var msgLen uint16
+        if err := binary.Read(stream, binary.BigEndian, &msgLen); err != nil {
+            stats.Errors++
+            return err
+        }
+
+        msgBytes := make([]byte, msgLen)
+        if _, err := io.ReadFull(stream, msgBytes); err != nil {
+            stats.Errors++
+            return err
+        }
+
+        stats.Errors++
+        return fmt.Errorf("server error: %s", string(msgBytes))
+    }
+
+    if responseHeader.DataLength == 0 {
+        stats.Errors++
+        return fmt.Errorf("empty file")
+    }
+
+    if responseHeader.DataLength > MAX_FILE_SIZE {
+        stats.Errors++
+        return fmt.Errorf("file too large")
+    }
+
+    buffer := make([]byte, CHUNK_SIZE)
+    var received uint64
+    var data []byte
+
+    for received < responseHeader.DataLength {
+        toRead := CHUNK_SIZE
+        remaining := responseHeader.DataLength - received
+        if remaining < uint64(toRead) {
+            toRead = int(remaining)
+        }
+
+        n, err := stream.Read(buffer[:toRead])
+        if err != nil && err != io.EOF {
+            stats.Errors++
+            return err
+        }
+
+        data = append(data, buffer[:n]...)
+        received += uint64(n)
+        stats.Bytes = received
+
+        if err == io.EOF {
+            break
+        }
+    }
+
+    if received != responseHeader.DataLength {
+        stats.Errors++
+        return fmt.Errorf("incomplete download: %d/%d", received, responseHeader.DataLength)
+    }
+
+    os.MkdirAll(filepath.Dir(localPath), 0755)
+
+    if err := os.WriteFile(localPath, data, 0644); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    stats.Duration = time.Since(startTime)
+    if stats.Duration > 0 {
+        stats.Speed = float64(stats.Bytes) / stats.Duration.Seconds()
+    }
+
+    return nil
 }
 
-type FileBrowser struct {
-	cwd    string
-	items  []BrowserItem
-	cursor int
+func (c *DFPClient) List(addr string, crypto *ProtocolCrypto) ([]FileMetadata, error) {
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return nil, err
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_LIST,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return nil, err
+    }
+
+    var count uint32
+    if err := binary.Read(stream, binary.BigEndian, &count); err != nil {
+        return nil, err
+    }
+
+    var files []FileMetadata
+
+    for i := uint32(0); i < count; i++ {
+        var encLen uint32
+        if err := binary.Read(stream, binary.BigEndian, &encLen); err != nil {
+            return nil, err
+        }
+
+        encData := make([]byte, encLen)
+        if _, err := io.ReadFull(stream, encData); err != nil {
+            return nil, err
+        }
+
+        metaBytes, err := crypto.DecryptData(encData)
+        if err != nil {
+            continue
+        }
+
+        metadata, err := FileMetadataFromBytes(metaBytes)
+        if err != nil {
+            continue
+        }
+
+        files = append(files, *metadata)
+    }
+
+    return files, nil
 }
 
-type BrowserItem struct {
-	name  string
-	isDir bool
-	size  int64
+func (c *DFPClient) Delete(addr, remoteName string, stats *TransferStats) error {
+    if c.version < 2 {
+        return fmt.Errorf("requires protocol version 2+")
+    }
+
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 2 {
+        return fmt.Errorf("server requires version 2+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DELETE,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(remoteName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    return nil
 }
 
-func NewFileBrowser() *FileBrowser {
-	cwd, _ := os.Getwd()
-	fb := &FileBrowser{cwd: cwd}
-	fb.scan()
-	return fb
+func (c *DFPClient) GetMetadata(addr, remoteName string, crypto *ProtocolCrypto) (*FileMetadata, error) {
+    if c.version < 2 {
+        return nil, fmt.Errorf("requires protocol version 2+")
+    }
+
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return nil, err
+    }
+
+    if negotiatedVersion < 2 {
+        return nil, fmt.Errorf("server requires version 2+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_META,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return nil, err
+    }
+
+    nameBytes := []byte(remoteName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        return nil, err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        return nil, err
+    }
+
+    var encLen uint32
+    if err := binary.Read(stream, binary.BigEndian, &encLen); err != nil {
+        return nil, err
+    }
+
+    encData := make([]byte, encLen)
+    if _, err := io.ReadFull(stream, encData); err != nil {
+        return nil, err
+    }
+
+    metaBytes, err := crypto.DecryptData(encData)
+    if err != nil {
+        return nil, err
+    }
+
+    return FileMetadataFromBytes(metaBytes)
 }
 
-func (fb *FileBrowser) scan() {
-	entries, _ := os.ReadDir(fb.cwd)
-	fb.items = []BrowserItem{{name: "..", isDir: true}}
-	
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		fb.items = append(fb.items, BrowserItem{
-			name:  e.Name(),
-			isDir: e.IsDir(),
-			size:  info.Size(),
-		})
-	}
-	
-	if fb.cursor >= len(fb.items) {
-		fb.cursor = len(fb.items) - 1
-	}
+func (c *DFPClient) Ping(addr string) (time.Duration, error) {
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return 0, err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return 0, err
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return 0, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_PING,
+        Flags:      0,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    start := time.Now()
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return 0, err
+    }
+
+    var response ProtocolHeader
+    if err := binary.Read(stream, binary.BigEndian, &response); err != nil {
+        return 0, err
+    }
+
+    if response.Command != CMD_PING {
+        return 0, fmt.Errorf("invalid response")
+    }
+
+    return time.Since(start), nil
 }
 
-func (fb *FileBrowser) Up() {
-	if fb.cursor > 0 {
-		fb.cursor--
-	}
+func (c *DFPClient) SetVersion(version uint8) error {
+    if version < MIN_VERSION || version > MAX_VERSION {
+        return fmt.Errorf("invalid version: %d", version)
+    }
+
+    c.version = version
+    return nil
 }
 
-func (fb *FileBrowser) Down() {
-	if fb.cursor < len(fb.items)-1 {
-		fb.cursor++
-	}
+func (c *DFPClient) GetVersion() uint8 {
+    return c.version
 }
 
-func (fb *FileBrowser) Select() (string, bool) {
-	if fb.cursor >= len(fb.items) {
-		return "", false
-	}
-	
-	item := fb.items[fb.cursor]
-	
-	if item.isDir {
-		if item.name == ".." {
-			fb.cwd = filepath.Dir(fb.cwd)
-		} else {
-			fb.cwd = filepath.Join(fb.cwd, item.name)
-		}
-		fb.cursor = 0
-		fb.scan()
-		return "", false
-	}
-	
-	return filepath.Join(fb.cwd, item.name), true
+func (c *DFPClient) DiskCreate(addr, diskName string, size, blockSize uint32, stats *TransferStats) error {
+    if c.version < 3 {
+        return fmt.Errorf("requires protocol version 3+")
+    }
+
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 3 {
+        return fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_CREATE,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if err := binary.Write(stream, binary.BigEndian, size); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if err := binary.Write(stream, binary.BigEndian, blockSize); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    return nil
 }
 
-func (fb *FileBrowser) View() string {
-	var b strings.Builder
-	b.WriteString(infoStyle.Render(fmt.Sprintf("📂 %s", fb.cwd)) + "\n\n")
-	
-	start := 0
-	end := len(fb.items)
-	if end > 15 {
-		if fb.cursor > 7 {
-			start = fb.cursor - 7
-		}
-		end = start + 15
-		if end > len(fb.items) {
-			end = len(fb.items)
-			start = end - 15
-			if start < 0 {
-				start = 0
-			}
-		}
-	}
-	
-	for i := start; i < end; i++ {
-		item := fb.items[i]
-		icon := "📄"
-		if item.isDir {
-			icon = "📁"
-		}
-		
-		line := fmt.Sprintf("%s %s", icon, item.name)
-		if !item.isDir && item.size > 0 {
-			line += fmt.Sprintf(" (%d bytes)", item.size)
-		}
-		
-		if i == fb.cursor {
-			b.WriteString(successStyle.Render("> " + line) + "\n")
-		} else {
-			b.WriteString(dimStyle.Render("  " + line) + "\n")
-		}
-	}
-	
-	return b.String()
+func (c *DFPClient) DiskDelete(addr, diskName string, stats *TransferStats) error {
+    if c.version < 3 {
+        return fmt.Errorf("requires protocol version 3+")
+    }
+
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 3 {
+        return fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_DELETE,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    return nil
 }
 
-func NewCliUI() *CliUI {
-	addr := textinput.New()
-	addr.Placeholder = "127.0.0.1:5000"
-	addr.Focus()
+func (c *DFPClient) DiskList(addr string, crypto *ProtocolCrypto) ([]DiskMetadata, error) {
+    if c.version < 3 {
+        return nil, fmt.Errorf("requires protocol version 3+")
+    }
 
-	prog := progress.New(progress.WithDefaultGradient())
-	
-	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Files on Server"
-	l.SetShowStatusBar(false)
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.CloseWithError(0, "")
 
-	return &CliUI{
-		state:      0,
-		action:     0,
-		addr:       addr,
-		browser:    NewFileBrowser(),
-		remoteList: l,
-		prog:       prog,
-		cli:        NewCli(),
-	}
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return nil, err
+    }
+
+    if negotiatedVersion < 3 {
+        return nil, fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_LIST,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return nil, err
+    }
+
+    var count uint32
+    if err := binary.Read(stream, binary.BigEndian, &count); err != nil {
+        return nil, err
+    }
+
+    var disks []DiskMetadata
+
+    for i := uint32(0); i < count; i++ {
+        var encLen uint32
+        if err := binary.Read(stream, binary.BigEndian, &encLen); err != nil {
+            return nil, err
+        }
+
+        encData := make([]byte, encLen)
+        if _, err := io.ReadFull(stream, encData); err != nil {
+            return nil, err
+        }
+
+        metaBytes, err := crypto.DecryptData(encData)
+        if err != nil {
+            continue
+        }
+
+        metadata, err := DiskMetadataFromBytes(metaBytes)
+        if err != nil {
+            continue
+        }
+
+        disks = append(disks, *metadata)
+    }
+
+    return disks, nil
 }
 
-func (c *CliUI) Init() tea.Cmd {
-	return textinput.Blink
+func (c *DFPClient) DiskOpen(addr, diskName string, stats *TransferStats) error {
+    if c.version < 3 {
+        return fmt.Errorf("requires protocol version 3+")
+    }
+
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 3 {
+        return fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_OPEN,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    return nil
 }
 
-func (c *CliUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		key := msg.String()
-		switch key {
-		case "ctrl+c":
-			return c, tea.Quit
-		case "q":
-			if c.state == 5 {
-				return c, tea.Quit
-			}
-		case "enter":
-			if c.state == 0 && c.addr.Value() != "" {
-				c.state = 1
-				return c, nil
-			} else if c.state == 2 {
-				if path, isFile := c.browser.Select(); isFile {
-					c.selFile = path
-					c.state = 3
-					c.progress = 0
-					return c, tea.Batch(c.doUpload(), updateProgress())
-				}
-			} else if c.state == 4 {
-				i, ok := c.remoteList.SelectedItem().(FileItem)
-				if ok {
-					c.remoteFile = i.Name
-					c.state = 3
-					c.progress = 0
-					return c, tea.Batch(c.doDownload(), updateProgress())
-				}
-			}
-		case "esc":
-			if c.state == 2 || c.state == 4 {
-				c.state = 1
-				return c, nil
-			} else if c.state == 1 {
-				c.state = 0
-				return c, nil
-			} else if c.state == 5 {
-				c.state = 1
-				c.err = ""
-				c.msg = ""
-				return c, nil
-			}
-		case "u":
-			if c.state == 1 {
-				c.action = 0
-				c.state = 2
-				return c, nil
-			}
-		case "d":
-			if c.state == 1 {
-				c.action = 1
-				c.state = 4
-				return c, c.loadRemoteFiles()
-			}
-		case "up", "k":
-			if c.state == 2 {
-				c.browser.Up()
-			} else if c.state == 4 {
-				var cmd tea.Cmd
-				c.remoteList, cmd = c.remoteList.Update(msg)
-				return c, cmd
-			}
-		case "down", "j":
-			if c.state == 2 {
-				c.browser.Down()
-			} else if c.state == 4 {
-				var cmd tea.Cmd
-				c.remoteList, cmd = c.remoteList.Update(msg)
-				return c, cmd
-			}
-		}
-	case progressMsg:
-		c.progress = float64(msg)
-		if c.progress >= 1.0 {
-			c.state = 5
-			if c.action == 0 {
-				c.msg = fmt.Sprintf("✅ Upload complete: %s", filepath.Base(c.selFile))
-			} else {
-				c.msg = fmt.Sprintf("✅ Download complete: %s", c.remoteFile)
-			}
-		}
-		return c, nil
-	case errMsg:
-		c.err = string(msg)
-		c.state = 5
-		return c, nil
-	case updateMsg:
-		if c.state == 3 && c.progress < 1.0 {
-			return c, updateProgress()
-		}
-	case filesMsg:
-		items := make([]list.Item, len(msg))
-		for i, f := range msg {
-			items[i] = f
-		}
-		c.remoteList.SetItems(items)
-		return c, nil
-	case tea.WindowSizeMsg:
-		c.remoteList.SetSize(msg.Width, msg.Height-10)
-	}
+func (c *DFPClient) DiskClose(addr, diskName string, stats *TransferStats) error {
+    if c.version < 3 {
+        return fmt.Errorf("requires protocol version 3+")
+    }
 
-	switch c.state {
-	case 0:
-		var cmd tea.Cmd
-		c.addr, cmd = c.addr.Update(msg)
-		return c, cmd
-	case 4:
-		var cmd tea.Cmd
-		c.remoteList, cmd = c.remoteList.Update(msg)
-		return c, cmd
-	}
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
 
-	return c, nil
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 3 {
+        return fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_CLOSE,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    return nil
 }
 
-func (c *CliUI) View() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("DFP Client") + "\n\n")
+func (c *DFPClient) DiskRead(addr, diskName string, offset, length uint64, stats *TransferStats) ([]byte, error) {
+    if c.version < 3 {
+        return nil, fmt.Errorf("requires protocol version 3+")
+    }
 
-	switch c.state {
-	case 0:
-		b.WriteString("Server address:\n")
-		b.WriteString(c.addr.View() + "\n\n")
-		b.WriteString(dimStyle.Render("Press Enter to continue"))
-	case 1:
-		b.WriteString("Choose action:\n\n")
-		b.WriteString(successStyle.Render("  [U] Upload file to server") + "\n")
-		b.WriteString(successStyle.Render("  [D] Download file from server") + "\n\n")
-		b.WriteString(dimStyle.Render("Press U or D | Esc: back"))
-	case 2:
-		b.WriteString("Select file to upload:\n\n")
-		b.WriteString(c.browser.View() + "\n")
-		b.WriteString(dimStyle.Render("↑/↓ or j/k: navigate | Enter: select | Esc: back"))
-	case 3:
-		if c.action == 0 {
-			b.WriteString(fmt.Sprintf("Uploading: %s\n\n", filepath.Base(c.selFile)))
-		} else {
-			b.WriteString(fmt.Sprintf("Downloading: %s\n\n", c.remoteFile))
-		}
-		b.WriteString(c.prog.ViewAs(c.progress) + "\n\n")
-		b.WriteString(infoStyle.Render(fmt.Sprintf("%.1f%%", c.progress*100)))
-	case 4:
-		b.WriteString("Select file to download:\n\n")
-		b.WriteString(c.remoteList.View() + "\n\n")
-		b.WriteString(dimStyle.Render("↑/↓: navigate | Enter: select | Esc: back"))
-	case 5:
-		if c.err != "" {
-			b.WriteString(errorStyle.Render("❌ Error: " + c.err))
-		} else {
-			b.WriteString(successStyle.Render(c.msg))
-		}
-		b.WriteString("\n\n" + dimStyle.Render("Press Esc to return or q to quit"))
-	}
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.CloseWithError(0, "")
 
-	return b.String()
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return nil, err
+    }
+
+    if negotiatedVersion < 3 {
+        return nil, fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_READ,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: length,
+    }
+    c.sequence++
+
+    startTime := time.Now()
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    if err := binary.Write(stream, binary.BigEndian, offset); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    if err := binary.Write(stream, binary.BigEndian, length); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    var responseHeader ProtocolHeader
+    if err := binary.Read(stream, binary.BigEndian, &responseHeader); err != nil {
+        stats.Errors++
+        return nil, err
+    }
+
+    if responseHeader.Command == CMD_ERROR {
+        var msgLen uint16
+        if err := binary.Read(stream, binary.BigEndian, &msgLen); err != nil {
+            stats.Errors++
+            return nil, err
+        }
+
+        msgBytes := make([]byte, msgLen)
+        if _, err := io.ReadFull(stream, msgBytes); err != nil {
+            stats.Errors++
+            return nil, err
+        }
+
+        stats.Errors++
+        return nil, fmt.Errorf("server error: %s", string(msgBytes))
+    }
+
+    if responseHeader.DataLength == 0 {
+        return []byte{}, nil
+    }
+
+    if responseHeader.DataLength > MAX_FILE_SIZE {
+        stats.Errors++
+        return nil, fmt.Errorf("data too large")
+    }
+
+    buffer := make([]byte, CHUNK_SIZE)
+    var received uint64
+    var data []byte
+
+    for received < responseHeader.DataLength {
+        toRead := CHUNK_SIZE
+        remaining := responseHeader.DataLength - received
+        if remaining < uint64(toRead) {
+            toRead = int(remaining)
+        }
+
+        n, err := stream.Read(buffer[:toRead])
+        if err != nil && err != io.EOF {
+            stats.Errors++
+            return nil, err
+        }
+
+        data = append(data, buffer[:n]...)
+        received += uint64(n)
+        stats.Bytes = received
+
+        if err == io.EOF {
+            break
+        }
+    }
+
+    if received != responseHeader.DataLength {
+        stats.Errors++
+        return nil, fmt.Errorf("incomplete read: %d/%d", received, responseHeader.DataLength)
+    }
+
+    stats.Duration = time.Since(startTime)
+    if stats.Duration > 0 {
+        stats.Speed = float64(stats.Bytes) / stats.Duration.Seconds()
+    }
+
+    return data, nil
 }
 
-type progressMsg float64
-type errMsg string
-type updateMsg time.Time
-type filesMsg []FileItem
+func (c *DFPClient) DiskWrite(addr, diskName string, offset uint64, data []byte, stats *TransferStats) error {
+    if c.version < 3 {
+        return fmt.Errorf("requires protocol version 3+")
+    }
 
-func updateProgress() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return updateMsg(t)
-	})
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return err
+    }
+    defer conn.CloseWithError(0, "")
+
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return err
+    }
+
+    if negotiatedVersion < 3 {
+        return fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_WRITE,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: uint64(len(data)),
+    }
+    c.sequence++
+
+    startTime := time.Now()
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if err := binary.Write(stream, binary.BigEndian, offset); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    sent := uint64(0)
+    for sent < uint64(len(data)) {
+        end := sent + CHUNK_SIZE
+        if end > uint64(len(data)) {
+            end = uint64(len(data))
+        }
+
+        n, err := stream.Write(data[sent:end])
+        if err != nil {
+            stats.Errors++
+            return err
+        }
+
+        sent += uint64(n)
+        stats.Bytes = sent
+    }
+
+    response := make([]byte, 1)
+    if _, err := io.ReadFull(stream, response); err != nil {
+        stats.Errors++
+        return err
+    }
+
+    if response[0] != ERR_NONE {
+        stats.Errors++
+        return fmt.Errorf("server error: %d", response[0])
+    }
+
+    stats.Duration = time.Since(startTime)
+    if stats.Duration > 0 {
+        stats.Speed = float64(stats.Bytes) / stats.Duration.Seconds()
+    }
+
+    return nil
 }
 
-func (c *CliUI) loadRemoteFiles() tea.Cmd {
-	return func() tea.Msg {
-		files, err := c.cli.List(c.addr.Value())
-		if err != nil {
-			return errMsg(err.Error())
-		}
-		return filesMsg(files)
-	}
-}
+func (c *DFPClient) DiskStat(addr, diskName string, crypto *ProtocolCrypto) (*DiskMetadata, error) {
+    if c.version < 3 {
+        return nil, fmt.Errorf("requires protocol version 3+")
+    }
 
-func (c *CliUI) doUpload() tea.Cmd {
-	return func() tea.Msg {
-		name := filepath.Base(c.selFile)
-		err := c.cli.Upload(c.addr.Value(), c.selFile, name, func(p float64) {
-			c.progress = p
-		})
-		if err != nil {
-			return errMsg(err.Error())
-		}
-		return progressMsg(1.0)
-	}
-}
+    conn, err := quic.DialAddr(context.Background(), addr, c.tlsConfig, c.quicConfig)
+    if err != nil {
+        return nil, err
+    }
+    defer conn.CloseWithError(0, "")
 
-func (c *CliUI) doDownload() tea.Cmd {
-	return func() tea.Msg {
-		savePath := filepath.Join("downloads", c.remoteFile)
-		os.MkdirAll("downloads", 0755)
-		
-		err := c.cli.Download(c.addr.Value(), c.remoteFile, savePath, func(p float64) {
-			c.progress = p
-		})
-		if err != nil {
-			return errMsg(err.Error())
-		}
-		return progressMsg(1.0)
-	}
+    negotiatedVersion, err := c.negotiateVersion(conn)
+    if err != nil {
+        return nil, err
+    }
+
+    if negotiatedVersion < 3 {
+        return nil, fmt.Errorf("server requires version 3+")
+    }
+
+    stream, err := conn.OpenStreamSync(context.Background())
+    if err != nil {
+        return nil, err
+    }
+    defer stream.Close()
+
+    header := ProtocolHeader{
+        Magic:      HEADER_MAGIC,
+        Version:    negotiatedVersion,
+        Command:    CMD_DISK_STAT,
+        Flags:      FLAG_VDISK,
+        Sequence:   c.sequence,
+        DataLength: 0,
+    }
+    c.sequence++
+
+    if err := binary.Write(stream, binary.BigEndian, header); err != nil {
+        return nil, err
+    }
+
+    nameBytes := []byte(diskName)
+    if err := binary.Write(stream, binary.BigEndian, uint32(len(nameBytes))); err != nil {
+        return nil, err
+    }
+
+    if _, err := stream.Write(nameBytes); err != nil {
+        return nil, err
+    }
+
+    var encLen uint32
+    if err := binary.Read(stream, binary.BigEndian, &encLen); err != nil {
+        return nil, err
+    }
+
+    encData := make([]byte, encLen)
+    if _, err := io.ReadFull(stream, encData); err != nil {
+        return nil, err
+    }
+
+    metaBytes, err := crypto.DecryptData(encData)
+    if err != nil {
+        return nil, err
+    }
+
+    return DiskMetadataFromBytes(metaBytes)
 }
